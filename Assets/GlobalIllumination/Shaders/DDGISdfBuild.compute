@@ -1,0 +1,174 @@
+#pragma kernel ClearCounts
+#pragma kernel RasterizeTriangles
+#pragma kernel BuildSDF
+
+#define BUDGET 12
+
+StructuredBuffer<float> _Triangles;
+RWStructuredBuffer<uint> _Counts;
+RWStructuredBuffer<uint> _Slots;
+RWTexture3D<float> _Out;
+
+uint _TriangleCount;
+int3 _VoxelCounts;
+float3 _Origin;
+float _VoxelSize;
+
+uint VoxelIndex(int3 c)
+{
+    return c.x + c.y * _VoxelCounts.x + c.z * _VoxelCounts.x * _VoxelCounts.y;
+}
+
+float3 VoxelCenter(int3 c)
+{
+    return _Origin + (float3(c) + 0.5) * _VoxelSize;
+}
+
+void ClosestPointOnTriangle(float3 p, float3 a, float3 b, float3 c, out float3 result)
+{
+    float3 ab = b - a;
+    float3 ac = c - a;
+    float3 ap = p - a;
+    float d1 = dot(ab, ap);
+    float d2 = dot(ac, ap);
+    if (d1 <= 0.0 && d2 <= 0.0)
+    {
+        result = a;
+        return;
+    }
+    float3 bp = p - b;
+    float d3 = dot(ab, bp);
+    float d4 = dot(ac, bp);
+    if (d3 >= 0.0 && d4 <= d3)
+    {
+        result = b;
+        return;
+    }
+    float vc = d1 * d4 - d3 * d2;
+    if (vc <= 0.0 && d1 >= 0.0 && d3 <= 0.0)
+    {
+        float v = d1 / (d1 - d3);
+        result = a + v * ab;
+        return;
+    }
+    float3 cp = p - c;
+    float d5 = dot(ab, cp);
+    float d6 = dot(ac, cp);
+    if (d6 >= 0.0 && d5 <= d6)
+    {
+        result = c;
+        return;
+    }
+    float vb = d5 * d2 - d1 * d6;
+    if (vb <= 0.0 && d2 >= 0.0 && d6 <= 0.0)
+    {
+        float w = d2 / (d2 - d6);
+        result = a + w * ac;
+        return;
+    }
+    float va = d3 * d6 - d5 * d4;
+    if (va <= 0.0 && (d4 - d3) >= 0.0 && (d5 - d6) >= 0.0)
+    {
+        float w = (d4 - d3) / ((d4 - d3) + (d5 - d6));
+        result = b + w * (c - b);
+        return;
+    }
+    float denom = 1.0 / (va + vb + vc);
+    float v = vb * denom;
+    float w = vc * denom;
+    result = a + ab * v + ac * w;
+}
+
+[numthreads(64, 1, 1)]
+void ClearCounts(uint id : SV_DispatchThreadID)
+{
+    uint total = (uint)(_VoxelCounts.x * _VoxelCounts.y * _VoxelCounts.z);
+    if (id < total)
+        _Counts[id] = 0;
+}
+
+[numthreads(64, 1, 1)]
+void RasterizeTriangles(uint id : SV_DispatchThreadID)
+{
+    if (id >= _TriangleCount)
+        return;
+
+    float3 a = float3(_Triangles[id * 9 + 0], _Triangles[id * 9 + 1], _Triangles[id * 9 + 2]);
+    float3 b = float3(_Triangles[id * 9 + 3], _Triangles[id * 9 + 4], _Triangles[id * 9 + 5]);
+    float3 c = float3(_Triangles[id * 9 + 6], _Triangles[id * 9 + 7], _Triangles[id * 9 + 8]);
+
+    float3 mn = min(a, min(b, c));
+    float3 mx = max(a, max(b, c));
+    int3 lo = clamp(int3(floor((mn - _Origin) / _VoxelSize)) - 1, int3(0, 0, 0), _VoxelCounts - 1);
+    int3 hi = clamp(int3(floor((mx - _Origin) / _VoxelSize)) + 1, int3(0, 0, 0), _VoxelCounts - 1);
+
+    float radius = 0.87 * _VoxelSize;
+
+    for (int z = lo.z; z <= hi.z; z++)
+    {
+        for (int y = lo.y; y <= hi.y; y++)
+        {
+            for (int x = lo.x; x <= hi.x; x++)
+            {
+                int3 cell = int3(x, y, z);
+                float3 p = VoxelCenter(cell);
+                float3 cp;
+                ClosestPointOnTriangle(p, a, b, c, cp);
+                if (distance(p, cp) <= radius)
+                {
+                    uint old;
+                    InterlockedAdd(_Counts[VoxelIndex(cell)], 1, old);
+                    if (old < BUDGET)
+                        _Slots[VoxelIndex(cell) * BUDGET + old] = id;
+                }
+            }
+        }
+    }
+}
+
+[numthreads(4, 4, 4)]
+void BuildSDF(uint3 id : SV_DispatchThreadID)
+{
+    if (any(id >= uint3(_VoxelCounts)))
+        return;
+
+    int3 cell = int3(id);
+    uint vox = VoxelIndex(cell);
+    float3 p = VoxelCenter(cell);
+
+    uint count = _Counts[vox];
+    int n = min(count, (uint)BUDGET);
+
+    float best = 1e30;
+    float vote = 0.0;
+
+    for (int i = 0; i < n; i++)
+    {
+        uint t = _Slots[vox * BUDGET + i];
+        float3 a = float3(_Triangles[t * 9 + 0], _Triangles[t * 9 + 1], _Triangles[t * 9 + 2]);
+        float3 b = float3(_Triangles[t * 9 + 3], _Triangles[t * 9 + 4], _Triangles[t * 9 + 5]);
+        float3 c = float3(_Triangles[t * 9 + 6], _Triangles[t * 9 + 7], _Triangles[t * 9 + 8]);
+
+        float3 cp;
+        ClosestPointOnTriangle(p, a, b, c, cp);
+        float d = distance(p, cp);
+        if (d < best)
+            best = d;
+
+        float3 nrm = cross(b - a, c - a);
+        float nl = length(nrm);
+        if (nl > 1e-12)
+        {
+            nrm /= nl;
+            float pd = dot(p - a, nrm);
+            float dd = max(d, 0.25 * _VoxelSize);
+            float w = 1.0 / (dd * dd);
+            vote += (pd > 0.0) ? w : -w;
+        }
+    }
+
+    float dist = (count == 0) ? 1000.0 : best;
+    if (vote < 0.0)
+        dist = -dist;
+    _Out[id] = dist;
+}
